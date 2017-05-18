@@ -1851,6 +1851,10 @@
          on the headphone/microphone jack. When false use the older uevent framework. -->
     <bool name="config_useDevInputEventForAudioJack">false</bool>
 
+    <!-- When true use the linux /dev/input/event subsystem to detect the switch changes
+         on the HDMI/DP jack. When false use the older uevent framework. -->
+    <bool name="config_useDevInputEventForHdmiAudioJack">false</bool>
+
     <!-- Whether safe headphone volume is enabled or not (country specific). -->
     <bool name="config_safe_media_volume_enabled">true</bool>
 

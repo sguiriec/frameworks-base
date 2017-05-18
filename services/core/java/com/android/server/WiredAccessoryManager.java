@@ -34,9 +34,11 @@ import com.android.server.input.InputManagerService.WiredAccessoryCallbacks;
 import static com.android.server.input.InputManagerService.SW_HEADPHONE_INSERT;
 import static com.android.server.input.InputManagerService.SW_MICROPHONE_INSERT;
 import static com.android.server.input.InputManagerService.SW_LINEOUT_INSERT;
+import static com.android.server.input.InputManagerService.SW_VIDEOOUT_INSERT;
 import static com.android.server.input.InputManagerService.SW_HEADPHONE_INSERT_BIT;
 import static com.android.server.input.InputManagerService.SW_MICROPHONE_INSERT_BIT;
 import static com.android.server.input.InputManagerService.SW_LINEOUT_INSERT_BIT;
+import static com.android.server.input.InputManagerService.SW_VIDEOOUT_INSERT_BIT;
 
 import java.io.File;
 import java.io.FileReader;
@@ -80,11 +82,13 @@ final class WiredAccessoryManager implements WiredAccessoryCallbacks {
     private int mHeadsetState;
 
     private int mSwitchValues;
+    private int mSwitchHdmiValues;
 
     private final WiredAccessoryObserver mObserver;
     private final InputManagerService mInputManager;
 
     private final boolean mUseDevInputEventForAudioJack;
+    private final boolean mUseDevInputEventForHdmiAudioJack;
 
     public WiredAccessoryManager(Context context, InputManagerService inputManager) {
         PowerManager pm = (PowerManager)context.getSystemService(Context.POWER_SERVICE);
@@ -95,6 +99,8 @@ final class WiredAccessoryManager implements WiredAccessoryCallbacks {
 
         mUseDevInputEventForAudioJack =
                 context.getResources().getBoolean(R.bool.config_useDevInputEventForAudioJack);
+        mUseDevInputEventForHdmiAudioJack =
+                context.getResources().getBoolean(R.bool.config_useDevInputEventForHdmiAudioJack);
 
         mObserver = new WiredAccessoryObserver();
     }
@@ -108,11 +114,26 @@ final class WiredAccessoryManager implements WiredAccessoryCallbacks {
             if (mInputManager.getSwitchState(-1, InputDevice.SOURCE_ANY, SW_MICROPHONE_INSERT) == 1) {
                 switchValues |= SW_MICROPHONE_INSERT_BIT;
             }
-            if (mInputManager.getSwitchState(-1, InputDevice.SOURCE_ANY, SW_LINEOUT_INSERT) == 1) {
-                switchValues |= SW_LINEOUT_INSERT_BIT;
+            if (!mUseDevInputEventForHdmiAudioJack) {
+                /* In case of usage of mUseDevInputEventForHdmiAudioJack we cannot have both LINEOUT and
+                 * VIDEOUT/AVOUT. Here additional update is needed in order to be able to pass a list
+                 * of dev/input to monitor for the different accessories (Headset/HDMI) */
+                if (mInputManager.getSwitchState(-1, InputDevice.SOURCE_ANY, SW_LINEOUT_INSERT) == 1) {
+                    switchValues |= SW_LINEOUT_INSERT_BIT;
+                }
             }
             notifyWiredAccessoryChanged(0, switchValues,
                     SW_HEADPHONE_INSERT_BIT | SW_MICROPHONE_INSERT_BIT | SW_LINEOUT_INSERT_BIT);
+        }
+        if (mUseDevInputEventForHdmiAudioJack) {
+            int switchHdmiValues = 0;
+            if (mInputManager.getSwitchState(-1, InputDevice.SOURCE_ANY, SW_VIDEOOUT_INSERT) == 1) {
+                switchHdmiValues |= SW_VIDEOOUT_INSERT_BIT;
+            }
+            if (mInputManager.getSwitchState(-1, InputDevice.SOURCE_ANY, SW_LINEOUT_INSERT) == 1) {
+                switchHdmiValues |= SW_LINEOUT_INSERT_BIT;
+            }
+            notifyWiredAccessoryHdmiChanged(0, switchHdmiValues, SW_VIDEOOUT_INSERT_BIT | SW_LINEOUT_INSERT_BIT);
         }
 
         mObserver.init();
@@ -156,6 +177,32 @@ final class WiredAccessoryManager implements WiredAccessoryCallbacks {
 
             updateLocked(NAME_H2W,
                 (mHeadsetState & ~(BIT_HEADSET | BIT_HEADSET_NO_MIC | BIT_LINEOUT)) | headset);
+        }
+    }
+
+    @Override
+    public void notifyWiredAccessoryHdmiChanged(long whenNanos, int switchValues, int switchMask) {
+        if (LOG) Slog.v(TAG, "notifyWiredAccessoryHdmiChanged: when=" + whenNanos
+                + " bits=" + switchCodeToString(switchValues, switchMask)
+                + " mask=" + Integer.toHexString(switchMask));
+
+        synchronized (mLock) {
+            int hdmi;
+            mSwitchHdmiValues = (mSwitchHdmiValues & ~switchMask) | switchValues;
+            switch (mSwitchHdmiValues & (SW_VIDEOOUT_INSERT_BIT | SW_LINEOUT_INSERT_BIT)) {
+                case SW_VIDEOOUT_INSERT_BIT | SW_LINEOUT_INSERT_BIT:
+                    hdmi = BIT_HDMI_AUDIO;
+                    break;
+
+                case 0:
+                case SW_VIDEOOUT_INSERT_BIT:
+                default:
+                    hdmi = 0;
+                    break;
+            }
+
+            updateLocked(NAME_HDMI,
+                (mHeadsetState & ~BIT_HDMI_AUDIO) | hdmi);
         }
     }
 
@@ -306,7 +353,15 @@ final class WiredAccessoryManager implements WiredAccessoryCallbacks {
         }
         if ((switchMask & SW_MICROPHONE_INSERT_BIT) != 0 &&
                 (switchValues & SW_MICROPHONE_INSERT_BIT) != 0) {
-            sb.append("SW_MICROPHONE_INSERT");
+            sb.append("SW_MICROPHONE_INSERT ");
+        }
+        if ((switchMask & SW_LINEOUT_INSERT_BIT) != 0 &&
+                (switchValues & SW_LINEOUT_INSERT_BIT) != 0) {
+            sb.append("SW_LINEOUT_INSERT ");
+        }
+        if ((switchMask & SW_VIDEOOUT_INSERT_BIT) != 0 &&
+                (switchValues & SW_VIDEOOUT_INSERT_BIT) != 0) {
+            sb.append("SW_VIDEOUT_INSERT");
         }
         return sb.toString();
     }
@@ -383,15 +438,17 @@ final class WiredAccessoryManager implements WiredAccessoryCallbacks {
             //
             // If the kernel does not have an "hdmi_audio" switch, just fall back on the older
             // "hdmi" switch instead.
-            uei = new UEventInfo(NAME_HDMI_AUDIO, BIT_HDMI_AUDIO, 0, 0);
-            if (uei.checkSwitchExists()) {
-                retVal.add(uei);
-            } else {
-                uei = new UEventInfo(NAME_HDMI, BIT_HDMI_AUDIO, 0, 0);
+            if (!mUseDevInputEventForHdmiAudioJack) {
+                uei = new UEventInfo(NAME_HDMI_AUDIO, BIT_HDMI_AUDIO, 0, 0);
                 if (uei.checkSwitchExists()) {
-                    retVal.add(uei);
+                retVal.add(uei);
                 } else {
-                    Slog.w(TAG, "This kernel does not have HDMI audio support");
+                    uei = new UEventInfo(NAME_HDMI, BIT_HDMI_AUDIO, 0, 0);
+                    if (uei.checkSwitchExists()) {
+                        retVal.add(uei);
+                    } else {
+                        Slog.w(TAG, "This kernel does not have HDMI audio support");
+                    }
                 }
             }
 
